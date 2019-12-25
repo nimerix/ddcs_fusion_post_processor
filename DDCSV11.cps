@@ -32,11 +32,15 @@ capabilities = CAPABILITY_MILLING | CAPABILITY_JET; // Adding Jet
 minimumChordLength = spatial(0.1, MM);
 minimumCircularRadius = spatial(0.1, MM);
 maximumCircularRadius = spatial(1000, MM);
+// minimumCircularSweep = toRad(0.01);
+// maximumCircularSweep = toRad(180);
 minimumCircularSweep = toRad(0.01);
-maximumCircularSweep = toRad(180);
-allowHelicalMoves = false;
+maximumCircularSweep = toRad(350); // based on GRBL
+// allowHelicalMoves = false;
+allowHelicalMoves = true;
 allowSpiralMoves = false;
-allowedCircularPlanes = (1 << PLANE_XY); // allow only X-Y circular motion
+// allowedCircularPlanes = (1 << PLANE_XY); // allow only X-Y circular motion
+allowedCircularPlanes = (1 << PLANE_XY) | (1 << PLANE_ZX) | (1 << PLANE_YZ);	// This is safer (instead of using 'undefined'), as it enumerates the allowed planes in GRBL
 
 properties = {
   spindleOnOffDelay: 1.0,
@@ -67,18 +71,30 @@ propertyDefinitions = {
     type: "number",
   },
 }
-var xyzFormat = createFormat({decimals:(3), forceDecimal:true, trim:false});
-var feedFormat = createFormat({decimals:(unit == MM ? 0 : 1), forceDecimal:false});
-var taperFormat = createFormat({decimals:1, scale:DEG});
 
-var xOutput = createVariable({prefix:"X", force:true}, xyzFormat);
-var yOutput = createVariable({prefix:"Y", force:true}, xyzFormat);
-var zOutput = createVariable({prefix:"Z", force:true}, xyzFormat);
-var aOutput = createVariable({prefix:"A", force:true}, xyzFormat);
+var gFormat = createFormat({ prefix: "G", decimals: 0 });
+var mFormat = createFormat({ prefix: "M", decimals: 0 });
 
-var iOutput = createReferenceVariable({prefix:"I", force:true}, xyzFormat);
-var jOutput = createReferenceVariable({prefix:"J", force:true}, xyzFormat);
-var feedOutput = createVariable({prefix:"F"}, feedFormat);
+var xyzFormat = createFormat({ decimals: (unit == MM ? 4 : 6), forceDecimal: true, trim: false });
+var feedFormat = createFormat({ decimals: (unit == MM ? 1 : 3), forceDecimal: false });
+var taperFormat = createFormat({ decimals: 1, scale: DEG });
+
+var xOutput = createVariable({ prefix: "X", force: true }, xyzFormat);
+var yOutput = createVariable({ prefix: "Y", force: true }, xyzFormat);
+var zOutput = createVariable({ prefix: "Z", force: true }, xyzFormat);
+var aOutput = createVariable({ prefix: "A", force: true }, xyzFormat);
+
+var iOutput = createReferenceVariable({ prefix: "I", force: true }, xyzFormat);
+var jOutput = createReferenceVariable({ prefix: "J", force: true }, xyzFormat);
+var kOutput = createReferenceVariable({ prefix: "K" }, xyzFormat);
+var feedOutput = createVariable({ prefix: "F" }, feedFormat);
+
+var gMotionModal = createModal({}, gFormat); 											// modal group 1 // G0-G3, ...
+var gPlaneModal = createModal({ onchange: function () { gMotionModal.reset(); } }, gFormat); // modal group 2 // G17-19
+var gAbsIncModal = createModal({}, gFormat); 											// modal group 3 // G90-91
+var gFeedModeModal = createModal({}, gFormat); 											// modal group 5 // G93-94
+var gUnitModal = createModal({}, gFormat); 												// modal group 6 // G20-21
+
 
 var safeRetractZ = 0; // safe Z coordinate for retraction
 var showSectionTools = false; // true to show the tool name in each section
@@ -100,16 +116,20 @@ function formatTool(tool) {
   if ((tool.taperAngle > 0) && (tool.taperAngle < Math.PI)) {
     str += " " + localize("TAPER") + "=" + taperFormat.format(tool.taperAngle) + localize("deg");
   }
-  
+
   return str;
 }
 
 function mmToInch(val) {
-  return (1.0 * val)/25.4
+  return (1.0 * val) / 25.4
 }
 function inchToMM(val) {
   return (1.0 * val) * 25.4
 }
+function writeBlock() {
+  writeWords(arguments);
+}
+
 function onOpen() {
   if (programName) {
     writeComment("Program: " + programName);
@@ -117,12 +137,12 @@ function onOpen() {
   if (programComment) {
     writeComment(programComment);
   }
- 
+
   var globalBounds; // Overall bounding box of tool travel throughout all sections
   var toolsUsed = []; // Tools used (hopefully just one) in the order they are used 
   var toolpathNames = []; // Names of toolpaths, i.e. sections
-  
-  var numberOfSections = getNumberOfSections(); 
+
+  var numberOfSections = getNumberOfSections();
   for (var i = 0; i < numberOfSections; ++i) {
     var section = getSection(i);
     var boundingBox = section.getGlobalBoundingBox();
@@ -132,7 +152,7 @@ function onOpen() {
       globalBounds = boundingBox;
 
     toolpathNames.push(section.getParameter("operation-comment"));
-    
+
     if (section.hasParameter('operation:clearanceHeight_value')) {
       safeRetractZ = Math.max(safeRetractZ, section.getParameter('operation:clearanceHeight_value'));
       if (section.getUnit() == MM && unit == IN) {
@@ -140,9 +160,9 @@ function onOpen() {
       }
       else if (section.getUnit() == IN && unit == MM) {
         safeRetractZ = inchToMM(safeRetractZ);
-      }       
+      }
     }
-   
+
     // This builds up the list of tools used in the order they are encountered, whereas getToolTable() returns an unordered list
     var tool = section.getTool();
     var desc = formatTool(tool);
@@ -154,58 +174,62 @@ function onOpen() {
   // may actually be the same physical tool but with different nominal feeds etc. This warning is only shown when the formatted tool
   // descriptions differ.
   if (toolsUsed.length > 1) {
-     var answer = promptKey2("WARNING: Multiple tools are used, but tool changes are not supported.",
-       toolsUsed.join("\r\n") + "\r\n\r\nContinue anyway?", "YN");
-     if (answer != "Y")
-       error("Tool changes are not supported");
-     
-     showSectionTools = true; // show the tool type used in each section.
+    var answer = promptKey2("WARNING: Multiple tools are used, but tool changes are not supported.",
+      toolsUsed.join("\r\n") + "\r\n\r\nContinue anyway?", "YN");
+    if (answer != "Y")
+      error("Tool changes are not supported");
+
+    showSectionTools = true; // show the tool type used in each section.
   }
 
   writeComment((numberOfSections > 1 ? "Toolpaths: " : "Toolpath: ") + toolpathNames.join(", "));
-  
+
   switch (unit) {
-  case IN:
-    writeComment("Units: inches");
-    break;
-  case MM:
-    writeComment("Units: millimeters");
-    break;
-  default:
-    error("Unsupported units: " + unit);
-    return;
+    case IN:
+      writeComment("Units: inches");
+      break;
+    case MM:
+      writeComment("Units: millimeters");
+      break;
+    default:
+      error("Unsupported units: " + unit);
+      return;
   }
-   
-  for (var i=0; i<toolsUsed.length; ++i) {
+
+  for (var i = 0; i < toolsUsed.length; ++i) {
     writeComment(toolsUsed[i]);
   }
-  
+
   writeComment("Workpiece:   " + formatBoundingBox(getWorkpiece()));
   writeComment("Tool travel: " + formatBoundingBox(globalBounds));
   writeComment("Safe Z: " + xyzFormat.format(safeRetractZ));
 
-  writeln("G90"); // absolute coordinates
-  
+  //   writeln("G90"); // absolute coordinates
+  writeBlock(gAbsIncModal.format(90), gFeedModeModal.format(94));
+  writeBlock(gPlaneModal.format(17));
   switch (unit) {
-  case IN:
-    writeln("G20"); // inches
-    writeln("G64 P" + mmToInch(tolerance_mm)); // precision in inches
-    break;
-  case MM:
-    writeln("G21"); // millimeters
-    writeln("G64 P" + tolerance_mm); // precision in mm
-    break;
+    case IN:
+      writeBlock(gUnitModal.format(20));
+      // writeln("G20"); // inches
+      // writeBlock(gUnitModal.format(64), )
+      writeln("G64 P" + mmToInch(tolerance_mm)); // precision in inches
+      break;
+    case MM:
+      writeBlock(gUnitModal.format(21));
+      // writeln("G21"); // millimeters
+      writeln("G64 P" + tolerance_mm); // precision in mm
+      break;
   }
-  
+
   writeln("G00 " + zOutput.format(safeRetractZ)); // retract to safe Z
 
-  onImpliedCommand(COMMAND_START_SPINDLE);
-  writeln("S " + getSection(0).getTool().spindleRPM); // initial spindle speed
-  writeln("M03"); // start spindle
+  // onImpliedCommand(COMMAND_START_SPINDLE);
+  // writeln("S " + getSection(0).getTool().spindleRPM); // initial spindle speed
+  // writeln("M03"); // start spindle
 }
 
 function writeComment(text) {
-  text = text.replace(/\(/g," ").replace(/\)/g," ");
+  text = text.replace(/\(/g, " ").replace(/\)/g, " ");
   writeln("(" + text + ")");
 }
 
@@ -217,19 +241,77 @@ function onComment(message) {
 }
 
 function onSection() {
+  var nmbrOfSections = getNumberOfSections();		// how many operations are there in total
+  var sectionId = getCurrentSectionId();			// what is the number of this operation (starts from 0)
+  var section = getSection(sectionId);			// what is the section-object for this operation
+  var comment = "Operation " + (sectionId + 1) + " of " + nmbrOfSections;
   if (hasParameter("operation-comment")) {
-    var comment = getParameter("operation-comment");
-    if (comment) {
-      writeComment("--- " + comment + " ---");
-    }
+    comment = comment + " : " + getParameter("operation-comment");
   }
-  
+  writeComment(comment);
+  writeln("");
+
+  // if (hasParameter("operation-comment")) {
+  //   var comment = getParameter("operation-comment");
+  //   if (comment) {
+  //     writeComment("--- " + comment + " ---");
+  //   }
+  // }
+
+  var tool = section.getTool();
+
   // We only show the tool in each section if there are multiple tools
   if (showSectionTools) {
-    writeComment(formatTool(currentSection.getTool()));
+    writeComment(formatTool(tool));
   }
-  
-  writeln("S " + currentSection.getTool().spindleRPM); // spindle speed
+  writeBlock(sOutput.format(tool.spindleRPM), mFormat.format(3));
+
+  // writeln("S " + currentSection.getTool().spindleRPM); // spindle speed
+
+  if (isFirstSection()) {
+    onDwell(properties.spindleOnOffDelay);
+  }
+
+  // coolant
+  if (properties.hasCoolant) {
+    if (tool.coolant == COOLANT_FLOOD) {
+      writeBlock(mFormat.format(8));
+    }
+    else if (tool.coolant == COOLANT_MIST) {
+      writeBlock(mFormat.format(7));
+    }
+    else if (tool.coolant == COOLANT_FLOOD_MIST) {
+      writeBlock(mFormat.format(7));
+      writeBlock(mFormat.format(8));
+    }
+    else {
+      writeBlock(mFormat.format(9));
+    }
+  }
+  // lubrication
+  if (properties.hasLubrication) {
+    if (tool.coolant == COOLANT_FLOOD
+      || tool.coolant == COOLANT_MIST
+      || tool.coolant == COOLANT_FLOOD_MIST) {
+      writeBlock(mFormat.format(10));
+    }
+    else {
+      writeBlock(mFormat.format(11));
+    }
+  }
+}
+
+function onDwell(seconds) {
+  writeBlock(gFormat.format(4), "P" + secFormat.format(seconds));
+}
+
+function onSectionEnd() {
+  xOutput.reset();						// resetting, so everything that comes after this section, will get X, Y, Z, F outputted, even if their values did not change..
+  yOutput.reset();
+  zOutput.reset();
+  feedOutput.reset();
+
+  writeln("");							// add a blank line at the end of each section
 }
 
 function onRapid(_x, _y, _z) {
@@ -237,7 +319,8 @@ function onRapid(_x, _y, _z) {
   var y = yOutput.format(_y);
   var z = zOutput.format(_z);
   if (x || y || z) {
-    writeln("G00 " + x + " " + y + " " + z);
+    writeBlock(gMotionModal.format(0), x, y, z);
+    feedOutput.reset();								// after a G0, we will always resend the Feedrate... Is this useful ?
   }
 }
 
@@ -246,25 +329,39 @@ function onLinear(_x, _y, _z, feed) {
   var y = yOutput.format(_y);
   var z = zOutput.format(_z);
   var f = feedOutput.format(feed);
-  if (x || y || z) {
-    writeln("G01 " + x + " " + y + " " + z + " " + f);
+
+  if (x || y || z || f) {
+    writeBlock(gMotionModal.format(1), x, y, z, f);
   }
 }
 
 function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
   var start = getCurrentPosition();
-  
-  var f = feedOutput.format(feed);
-  if (f) {
-    writeln(f);
+
+  // var f = feedOutput.format(feed);
+  // if (f) {
+  //   writeln(f);
+  // }
+
+  // writeln((clockwise ? "G02 " : "G03 ") +
+  //   xOutput.format(x) + " " +
+  //   yOutput.format(y) + " " +
+  //   zOutput.format(z) + " " +
+  //   iOutput.format(cx - start.x, 0) + " " +
+  //   jOutput.format(cy - start.y, 0));
+  switch (getCircularPlane()) {
+    case PLANE_XY:
+      writeBlock(gPlaneModal.format(17), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), iOutput.format(cx - start.x, 0), jOutput.format(cy - start.y, 0), feedOutput.format(feed));
+      break;
+    case PLANE_ZX:
+      writeBlock(gPlaneModal.format(18), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), iOutput.format(cx - start.x, 0), kOutput.format(cz - start.z, 0), feedOutput.format(feed));
+      break;
+    case PLANE_YZ:
+      writeBlock(gPlaneModal.format(19), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), jOutput.format(cy - start.y, 0), kOutput.format(cz - start.z, 0), feedOutput.format(feed));
+      break;
+    default:
+      linearize(tolerance);
   }
-  
-  writeln((clockwise ? "G02 " : "G03 ") + 
-    xOutput.format(x) + " " +
-    yOutput.format(y) + " " +
-    zOutput.format(z) + " " +
-    iOutput.format(cx - start.x, 0) + " " +
-    jOutput.format(cy - start.y, 0));
 }
 
 function onOrientateSpindle(_a) {
@@ -277,7 +374,17 @@ function onOrientateSpindle(_a) {
 function onClose() {
   writeln("G00 " + zOutput.format(safeRetractZ)); // retract to safe Z
   onImpliedCommand(COMMAND_STOP_SPINDLE);
-  writeln("M5");
+  writeBlock(mFormat.format(5));
+  if (properties.hasCoolant) {
+    writeBlock(mFormat.format(9));
+  }
+  if (properties.hasLubrication) {
+    writeBlock(mFormat.format(11));
+  }
+  onDwell(properties.spindleOnOffDelay);
+  // writeln("M5");
   onImpliedCommand(COMMAND_END);
-  writeln("M2");
+  // writeln("M2");
+  writeBlock(mFormat.format(30));																					// Program End
+  writeln("%");
 }
